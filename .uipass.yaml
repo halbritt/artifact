@@ -1,0 +1,15 @@
+schema_version: 1
+app:
+  build: [make, build]
+  serve: [python3, tests/ui_fixture.py, '{port}']
+  ready_path: /sample/_artifact/
+viewports:
+  phone: {width: 390, height: 844}
+  desktop: {width: 1280, height: 900}
+surfaces:
+  home:
+    states:
+      instructions: {route: /, ready: h1}
+  publication:
+    states:
+      files: {route: /sample/_artifact/, ready: ul}
