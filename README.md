@@ -113,7 +113,7 @@ Back up `published/` to retain artifact contents. Publication uses filesystem
 atomic rename, not an fsync-based power-loss durability guarantee.
 
 Production systemd and Cloudflare configuration is maintained in
-[infra](https://github.com/halbritt/infra/tree/main/hosts/proximal/config/artifact).
+[infra](https://github.com/halbritt/infra/tree/master/hosts/proximal/config/artifact).
 
 ## Development
 
