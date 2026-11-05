@@ -12,6 +12,7 @@ import (
 
 const MaxUploadBytes int64 = 90 << 20
 const MaxFiles = 1000
+const MaxReceiptBytes int64 = 32 << 20
 const DefaultURL = "https://artifact.harm.org"
 const metadataDir = "_artifact"
 

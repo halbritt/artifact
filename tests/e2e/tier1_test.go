@@ -263,8 +263,15 @@ func TestTier1_ARTIFACT2_LargeInventory(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Generate 1,000 files with nested long path components
-	// (Under 5 directory components to stay under path limits)
-	nestedDir := filepath.Join(tmpDir, "dir1", "dir2", "dir3")
+	// (5 directory components of 180 bytes each to exceed 2 MiB receipt limit)
+	nestedDir := filepath.Join(
+		tmpDir,
+		strings.Repeat("a", 180),
+		strings.Repeat("b", 180),
+		strings.Repeat("c", 180),
+		strings.Repeat("d", 180),
+		strings.Repeat("e", 180),
+	)
 	if err := os.MkdirAll(nestedDir, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -289,6 +296,9 @@ func TestTier1_ARTIFACT2_LargeInventory(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(res.Stdout), &receipt); err != nil {
 		t.Fatalf("decode receipt: %v. Output: %s", err, res.Stdout)
+	}
+	if len(res.Stdout) <= 2<<20 {
+		t.Fatalf("expected stdout receipt > 2 MiB, got %d bytes", len(res.Stdout))
 	}
 	if len(receipt.Files) != 1000 {
 		t.Fatalf("expected 1000 files in receipt, got %d", len(receipt.Files))

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func fixture(t *testing.T) (*Store, *httptest.Server) {
@@ -774,3 +775,286 @@ func TestRangeRequestsPreserveNoStoreAndSecurityHeaders(t *testing.T) {
 	}
 	checkSecurityHeaders(t, resp416)
 }
+
+func TestReceiptLimitOversizedAndLargeValid(t *testing.T) {
+	tmpDir := t.TempDir()
+	sampleFile := filepath.Join(tmpDir, "sample.txt")
+	sampleContent := []byte("hello world")
+	if err := os.WriteFile(sampleFile, sampleContent, 0644); err != nil {
+		t.Fatal(err)
+	}
+	sampleHash := fmt.Sprintf("%x", sha256.Sum256(sampleContent))
+	files, err := Collect([]string{sampleFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	makeReceipt := func(serverURL string, titleSize int) Receipt {
+		return Receipt{
+			ID:          "large-id",
+			Title:       strings.Repeat("A", titleSize),
+			CreatedAt:   time.Now().UTC(),
+			URL:         serverURL + "/large-id/",
+			FilesURL:    serverURL + "/large-id/_artifact/",
+			DownloadURL: serverURL + "/large-id/bundle.zip",
+			ManifestURL: serverURL + "/large-id/manifest.json",
+			Files: []File{
+				{
+					Path:        "sample.txt",
+					Size:        int64(len(sampleContent)),
+					SHA256:      sampleHash,
+					URL:         serverURL + "/large-id/sample.txt",
+					DownloadURL: serverURL + "/large-id/sample.txt?download=1",
+				},
+			},
+		}
+	}
+
+	t.Run("valid 3 MiB receipt and manifest succeeds under 32 MiB limit", func(t *testing.T) {
+		var serverURL string
+		var receipt Receipt
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "GET" && r.URL.Path == "/large-id/manifest.json" {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(receipt)
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/artifacts" {
+				receipt = makeReceipt(serverURL, 3<<20) // 3 MiB title
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(receipt)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+		serverURL = server.URL
+
+		res, err := PublishFiles(context.Background(), server.Client(), server.URL, files, Options{})
+		if err != nil {
+			t.Fatalf("expected successful publish for 3 MiB receipt, got error: %v", err)
+		}
+		if res == nil || res.ID != "large-id" {
+			t.Fatalf("unexpected receipt: %+v", res)
+		}
+	})
+
+	t.Run("oversized 33 MiB receipt exceeds 32 MiB limit and fails cleanly", func(t *testing.T) {
+		var serverURL string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "POST" && r.URL.Path == "/api/artifacts" {
+				receipt := makeReceipt(serverURL, 33<<20) // 33 MiB title > 32 MiB limit
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(receipt)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+		serverURL = server.URL
+
+		res, err := PublishFiles(context.Background(), server.Client(), server.URL, files, Options{})
+		if err == nil {
+			t.Fatalf("expected error for oversized receipt > 32 MiB, got success: %+v", res)
+		}
+	})
+
+	t.Run("oversized 33 MiB manifest exceeds 32 MiB limit and fails cleanly", func(t *testing.T) {
+		var serverURL string
+		var receipt Receipt
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "GET" && r.URL.Path == "/large-id/manifest.json" {
+				w.Header().Set("Content-Type", "application/json")
+				oversizedManifest := makeReceipt(serverURL, 33<<20)
+				_ = json.NewEncoder(w).Encode(oversizedManifest)
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/artifacts" {
+				receipt = makeReceipt(serverURL, 100)
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(receipt)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+		serverURL = server.URL
+
+		res, err := PublishFiles(context.Background(), server.Client(), server.URL, files, Options{})
+		if err == nil {
+			t.Fatalf("expected error for oversized manifest > 32 MiB, got success: %+v", res)
+		}
+		if !strings.Contains(err.Error(), "manifest verification failed") {
+			t.Fatalf("expected 'manifest verification failed', got: %v", err)
+		}
+	})
+}
+
+func TestReceiptInventoryExactBijection(t *testing.T) {
+	tmpDir := t.TempDir()
+	f1Path := filepath.Join(tmpDir, "file1.txt")
+	f2Path := filepath.Join(tmpDir, "file2.txt")
+	c1 := []byte("content 1")
+	c2 := []byte("content 2")
+	if err := os.WriteFile(f1Path, c1, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f2Path, c2, 0644); err != nil {
+		t.Fatal(err)
+	}
+	h1 := fmt.Sprintf("%x", sha256.Sum256(c1))
+	h2 := fmt.Sprintf("%x", sha256.Sum256(c2))
+
+	files, err := Collect([]string{f1Path, f2Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name          string
+		receiptFiles  []File
+		manifestFiles []File
+		wantSuccess   bool
+		errContains   string
+	}{
+		{
+			name: "valid exact match",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "file2.txt", SHA256: h2, Size: int64(len(c2))},
+			},
+			wantSuccess: true,
+		},
+		{
+			name: "duplicate file in receipt",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+			},
+			wantSuccess: false,
+			errContains: "duplicate file in receipt",
+		},
+		{
+			name: "unknown file with empty hash",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "ghost.txt", SHA256: "", Size: 0},
+			},
+			wantSuccess: false,
+			errContains: "unexpected file",
+		},
+		{
+			name: "unknown file with valid other hash",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "ghost.txt", SHA256: h2, Size: int64(len(c2))},
+			},
+			wantSuccess: false,
+			errContains: "unexpected file",
+		},
+		{
+			name: "missing file count too low",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+			},
+			wantSuccess: false,
+			errContains: "file count mismatch",
+		},
+		{
+			name: "extra file count too high",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "file2.txt", SHA256: h2, Size: int64(len(c2))},
+				{Path: "file3.txt", SHA256: "deadbeef", Size: 10},
+			},
+			wantSuccess: false,
+			errContains: "file count mismatch",
+		},
+		{
+			name: "wrong checksum on known file",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "file2.txt", SHA256: strings.Repeat("0", 64), Size: int64(len(c2))},
+			},
+			wantSuccess: false,
+			errContains: "checksum mismatch",
+		},
+		{
+			name: "receipt valid but manifest tampered",
+			receiptFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "file2.txt", SHA256: h2, Size: int64(len(c2))},
+			},
+			manifestFiles: []File{
+				{Path: "file1.txt", SHA256: h1, Size: int64(len(c1))},
+				{Path: "tampered.txt", SHA256: h2, Size: int64(len(c2))},
+			},
+			wantSuccess: false,
+			errContains: "manifest verification failed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var serverURL string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" && r.URL.Path == "/manifest.json" {
+					mFiles := tc.manifestFiles
+					if mFiles == nil {
+						mFiles = tc.receiptFiles
+					}
+					manifest := Receipt{
+						ID:          "fix-id",
+						Title:       "test",
+						CreatedAt:   time.Unix(1000, 0).UTC(),
+						URL:         serverURL + "/fix-id/",
+						FilesURL:    serverURL + "/fix-id/_artifact/",
+						DownloadURL: serverURL + "/fix-id/bundle.zip",
+						ManifestURL: serverURL + "/manifest.json",
+						Files:       mFiles,
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(manifest)
+					return
+				}
+				if r.Method == "POST" && r.URL.Path == "/api/artifacts" {
+					receipt := Receipt{
+						ID:          "fix-id",
+						Title:       "test",
+						CreatedAt:   time.Unix(1000, 0).UTC(),
+						URL:         serverURL + "/fix-id/",
+						FilesURL:    serverURL + "/fix-id/_artifact/",
+						DownloadURL: serverURL + "/fix-id/bundle.zip",
+						ManifestURL: serverURL + "/manifest.json",
+						Files:       tc.receiptFiles,
+					}
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(receipt)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+			serverURL = server.URL
+
+			res, err := PublishFiles(context.Background(), server.Client(), server.URL, files, Options{Title: "test"})
+			if tc.wantSuccess {
+				if err != nil {
+					t.Fatalf("expected success, got error: %v", err)
+				}
+				if res == nil || len(res.Files) != len(tc.receiptFiles) {
+					t.Fatalf("unexpected receipt: %+v", res)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil error and receipt %+v", tc.errContains, res)
+				}
+				if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("expected error to contain %q, got %q", tc.errContains, err.Error())
+				}
+			}
+		})
+	}
+}
+
+

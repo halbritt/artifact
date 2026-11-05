@@ -177,16 +177,28 @@ func PublishFiles(ctx context.Context, client *http.Client, base string, files [
 		return nil, fmt.Errorf("publish: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(message)))
 	}
 	var receipt Receipt
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&receipt); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxReceiptBytes)).Decode(&receipt); err != nil {
 		return nil, err
 	}
 	if len(receipt.Files) != len(hashes) {
-		return nil, errors.New("server receipt has unexpected file count")
+		return nil, fmt.Errorf("receipt file count mismatch: got %d, expected %d", len(receipt.Files), len(hashes))
 	}
+	seen := make(map[string]bool, len(hashes))
 	for _, f := range receipt.Files {
-		if hashes[f.Path] != f.SHA256 {
+		want, ok := hashes[f.Path]
+		if !ok {
+			return nil, fmt.Errorf("receipt contains unexpected file: %s", f.Path)
+		}
+		if seen[f.Path] {
+			return nil, fmt.Errorf("duplicate file in receipt: %s", f.Path)
+		}
+		seen[f.Path] = true
+		if want != f.SHA256 {
 			return nil, fmt.Errorf("server checksum mismatch for %s", f.Path)
 		}
+	}
+	if len(seen) != len(hashes) {
+		return nil, errors.New("server receipt does not match uploaded files")
 	}
 	check, err := http.NewRequestWithContext(ctx, "GET", receipt.ManifestURL, nil)
 	if err != nil {
@@ -197,7 +209,7 @@ func PublishFiles(ctx context.Context, client *http.Client, base string, files [
 		return nil, fmt.Errorf("published at %s but verification failed: %w", receipt.URL, err)
 	}
 	defer verified.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(verified.Body, 2<<20))
+	data, err := io.ReadAll(io.LimitReader(verified.Body, MaxReceiptBytes))
 	if err != nil {
 		return nil, err
 	}
