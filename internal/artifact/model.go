@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const MaxUploadBytes int64 = 90 << 20
@@ -38,7 +39,7 @@ type Receipt struct {
 }
 
 func validPath(name string) bool {
-	if name == "" || name == "." || strings.HasPrefix(name, "/") || path.Clean(name) != name || strings.Contains(name, "\\") {
+	if name == "" || name == "." || strings.HasPrefix(name, "/") || !utf8.ValidString(name) || path.Clean(name) != name || strings.Contains(name, "\\") {
 		return false
 	}
 	for _, part := range strings.Split(name, "/") {
@@ -58,7 +59,7 @@ func fileURL(base, id, name string) string {
 }
 func ValidateBaseURL(raw string) error {
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+	if err != nil || strings.ContainsAny(raw, "?#") || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return fmt.Errorf("server must be an http(s) origin, got %q", raw)
 	}
 	return nil

@@ -42,6 +42,9 @@ func Collect(inputs []string) ([]SourceFile, error) {
 		return nil
 	}
 	for _, input := range inputs {
+		if input == "" {
+			return nil, errors.New("empty publication path")
+		}
 		input = filepath.Clean(input)
 		info, err := os.Lstat(input)
 		if err != nil {
