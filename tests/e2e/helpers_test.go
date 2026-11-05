@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/halbritt/artifact/internal/artifact"
 )
 
 var (
@@ -242,6 +244,7 @@ func buildCustomMultipart(t *testing.T, optionsJSON *string, parts []MultipartFi
 		h.Set("Content-Type", "application/octet-stream")
 		if p.PathHeader != "" {
 			h.Set("X-Artifact-Path", p.PathHeader)
+			h.Set("X-Artifact-Path-Escaped", artifact.EscapePath(p.PathHeader))
 		}
 		partWriter, err := w.CreatePart(h)
 		if err != nil {

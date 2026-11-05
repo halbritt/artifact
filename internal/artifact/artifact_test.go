@@ -528,3 +528,249 @@ func TestPublishUnicodePathsRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestEscapePath(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"simple.txt", "simple.txt"},
+		{"a/b/c.txt", "a/b/c.txt"},
+		{" leading .txt ", "%20leading%20.txt%20"},
+		{"  folder / sub / file  .txt ", "%20%20folder%20/%20sub%20/%20file%20%20.txt%20"},
+		{"hello world/test#1.txt", "hello%20world/test%231.txt"},
+	}
+	for _, tt := range tests {
+		if got := EscapePath(tt.input); got != tt.want {
+			t.Errorf("EscapePath(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestPublishPreservesLeadingAndTrailingSpaces(t *testing.T) {
+	_, server := fixture(t)
+	dir := t.TempDir()
+	files := map[string]string{
+		" leading_and_trailing.txt ":             "space content 1",
+		"  folder with spaces  /  file  .txt  ": "space content 2",
+	}
+	for name, data := range files {
+		writeFile(t, dir, name, data)
+	}
+	collected, err := Collect([]string{dir})
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	receipt, err := PublishFiles(context.Background(), server.Client(), server.URL, collected, Options{Title: "Spaces Test"})
+	if err != nil {
+		t.Fatalf("PublishFiles failed: %v", err)
+	}
+	if len(receipt.Files) != len(files) {
+		t.Fatalf("expected %d files, got %d", len(files), len(receipt.Files))
+	}
+	for _, f := range receipt.Files {
+		expectedContent, ok := files[f.Path]
+		if !ok {
+			t.Fatalf("unexpected path in receipt: %q", f.Path)
+		}
+		resp, data := fetch(t, f.URL)
+		if resp.StatusCode != 200 || string(data) != expectedContent {
+			t.Fatalf("fetch %q failed: %d, data: %s", f.Path, resp.StatusCode, data)
+		}
+	}
+	resp, data := fetch(t, receipt.DownloadURL)
+	if resp.StatusCode != 200 {
+		t.Fatalf("download zip failed: %d", resp.StatusCode)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archive.File) != len(files) {
+		t.Fatalf("archive file count: expected %d, got %d", len(files), len(archive.File))
+	}
+	for _, f := range archive.File {
+		expectedContent, ok := files[f.Name]
+		if !ok {
+			t.Fatalf("unexpected archive entry: %q", f.Name)
+		}
+		r, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		content, err := io.ReadAll(r)
+		r.Close()
+		if err != nil || string(content) != expectedContent {
+			t.Fatalf("bad content in archive for %s", f.Name)
+		}
+	}
+}
+
+func TestPublishOptionsUploadLimitPreservesHTTP413(t *testing.T) {
+	_, server := fixture(t)
+	var prefix bytes.Buffer
+	writer := multipart.NewWriter(&prefix)
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", `form-data; name="options"`)
+	if _, err := writer.CreatePart(h); err != nil {
+		t.Fatal(err)
+	}
+	body := io.MultiReader(bytes.NewReader(prefix.Bytes()), io.LimitReader(zeroReader{}, MaxUploadBytes+1000))
+	req, err := http.NewRequest("POST", server.URL+"/api/artifacts", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected HTTP 413 for oversized options, got %d", resp.StatusCode)
+	}
+}
+
+func TestPublishOptionsMalformedUnderLimitReturns400(t *testing.T) {
+	_, server := fixture(t)
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	largeBadOptions := strings.Repeat("x", 10000)
+	if err := writer.WriteField("options", largeBadOptions); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest("POST", server.URL+"/api/artifacts", &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for malformed options under limit, got %d", resp.StatusCode)
+	}
+}
+
+func TestPublishUnrepresentablePathReturns400(t *testing.T) {
+	_, server := fixture(t)
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	h := make(textproto.MIMEHeader)
+	tooLong := strings.Repeat("a", 300) + ".txt"
+	h.Set("Content-Disposition", `form-data; name="file"; filename="file.txt"`)
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("X-Artifact-Path-Escaped", EscapePath(tooLong))
+	part, err := writer.CreatePart(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest("POST", server.URL+"/api/artifacts", &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for unrepresentable path, got %d", resp.StatusCode)
+	}
+}
+
+func TestRangeRequestsPreserveNoStoreAndSecurityHeaders(t *testing.T) {
+	_, server := fixture(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "data.txt", "0123456789abcdefghijklmnopqrstuvwxyz")
+	files, err := Collect([]string{dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := PublishFiles(context.Background(), server.Client(), server.URL, files, Options{Title: "Range Test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetURL := receipt.Files[0].URL
+
+	checkSecurityHeaders := func(t *testing.T, resp *http.Response) {
+		t.Helper()
+		if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+			t.Errorf("Cache-Control: got %q, want 'no-store'", got)
+		}
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("X-Content-Type-Options: got %q, want 'nosniff'", got)
+		}
+		if got := resp.Header.Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("Referrer-Policy: got %q, want 'no-referrer'", got)
+		}
+		if got := resp.Header.Get("X-Robots-Tag"); got != "noindex, nofollow, noarchive" {
+			t.Errorf("X-Robots-Tag: got %q, want 'noindex, nofollow, noarchive'", got)
+		}
+	}
+
+	// 1. Full GET (200)
+	req200, _ := http.NewRequest("GET", targetURL, nil)
+	resp200, err := server.Client().Do(req200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp200.Body.Close()
+	if resp200.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp200.StatusCode)
+	}
+	checkSecurityHeaders(t, resp200)
+
+	// 2. Partial Content (206)
+	req206, _ := http.NewRequest("GET", targetURL, nil)
+	req206.Header.Set("Range", "bytes=0-9")
+	resp206, err := server.Client().Do(req206)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data206, _ := io.ReadAll(resp206.Body)
+	resp206.Body.Close()
+	if resp206.StatusCode != http.StatusPartialContent || string(data206) != "0123456789" {
+		t.Fatalf("expected 206 with '0123456789', got %d %q", resp206.StatusCode, string(data206))
+	}
+	checkSecurityHeaders(t, resp206)
+
+	// 3. Suffix Range (206)
+	reqSuffix, _ := http.NewRequest("GET", targetURL, nil)
+	reqSuffix.Header.Set("Range", "bytes=-6")
+	respSuffix, err := server.Client().Do(reqSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSuffix, _ := io.ReadAll(respSuffix.Body)
+	respSuffix.Body.Close()
+	if respSuffix.StatusCode != http.StatusPartialContent || string(dataSuffix) != "uvwxyz" {
+		t.Fatalf("expected 206 with 'uvwxyz', got %d %q", respSuffix.StatusCode, string(dataSuffix))
+	}
+	checkSecurityHeaders(t, respSuffix)
+
+	// 4. Unsatisfiable Range (416)
+	req416, _ := http.NewRequest("GET", targetURL, nil)
+	req416.Header.Set("Range", "bytes=1000-2000")
+	resp416, err := server.Client().Do(req416)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp416.Body.Close()
+	if resp416.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("expected 416, got %d", resp416.StatusCode)
+	}
+	checkSecurityHeaders(t, resp416)
+}

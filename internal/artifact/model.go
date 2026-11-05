@@ -49,13 +49,19 @@ func validPath(name string) bool {
 	}
 	return !strings.ContainsFunc(name, unicode.IsControl)
 }
-func fileURL(base, id, name string) string {
-	u := strings.TrimRight(base, "/") + "/" + id + "/"
+// EscapePath escapes each segment of a /-separated path using url.PathEscape,
+// preserving the '/' separators.
+func EscapePath(name string) string {
 	parts := strings.Split(name, "/")
 	for i := range parts {
 		parts[i] = url.PathEscape(parts[i])
 	}
-	return u + strings.Join(parts, "/")
+	return strings.Join(parts, "/")
+}
+
+func fileURL(base, id, name string) string {
+	u := strings.TrimRight(base, "/") + "/" + id + "/"
+	return u + EscapePath(name)
 }
 func ValidateBaseURL(raw string) error {
 	u, err := url.Parse(raw)

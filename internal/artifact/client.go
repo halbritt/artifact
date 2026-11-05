@@ -121,6 +121,7 @@ func PublishFiles(ctx context.Context, client *http.Client, base string, files [
 		header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": filepath.Base(src.Path)}))
 		header.Set("Content-Type", "application/octet-stream")
 		header.Set("X-Artifact-Path", src.Path)
+		header.Set("X-Artifact-Path-Escaped", EscapePath(src.Path))
 		part, err := writer.CreatePart(header)
 		if err != nil {
 			return nil, err

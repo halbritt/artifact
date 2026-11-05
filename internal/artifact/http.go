@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"html/template"
+	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -21,6 +22,50 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 artifact publish ./results/ --entry index.html
 artifact publish chart.svg results.csv --json</pre><p>HTML opens in your browser. Every publication includes individual downloads and a ZIP bundle.</p><p><a href="https://github.com/halbritt/artifact">CLI and documentation</a></p>{{end}}</main></html>`))
 
+type noStoreResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *noStoreResponseWriter) applyHeaders() {
+	if !w.wroteHeader {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+		h.Set("Cache-Control", "no-store")
+		w.wroteHeader = true
+	}
+}
+
+func (w *noStoreResponseWriter) WriteHeader(code int) {
+	w.applyHeaders()
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *noStoreResponseWriter) Write(b []byte) (int, error) {
+	w.applyHeaders()
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *noStoreResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *noStoreResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *noStoreResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.applyHeaders()
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(w.ResponseWriter, r)
+}
+
 func (s *Store) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/artifacts", s.upload)
@@ -34,7 +79,7 @@ func (s *Store) Handler() http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
 		w.Header().Set("Cache-Control", "no-store")
-		mux.ServeHTTP(w, r)
+		mux.ServeHTTP(&noStoreResponseWriter{ResponseWriter: w}, r)
 	})
 }
 func (s *Store) upload(w http.ResponseWriter, r *http.Request) {

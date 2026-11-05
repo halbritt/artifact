@@ -10,11 +10,14 @@ import (
 	"io"
 	"math/big"
 	"mime/multipart"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -67,7 +70,19 @@ func (s *Store) Publish(reader *multipart.Reader) (*Receipt, error) {
 				return nil, bad("duplicate options")
 			}
 			data, err := io.ReadAll(io.LimitReader(part, 8193))
-			if err != nil || len(data) > 8192 {
+			if err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					return nil, err
+				}
+				return nil, bad("invalid options")
+			}
+			if len(data) > 8192 {
+				_, copyErr := io.Copy(io.Discard, part)
+				var tooLarge *http.MaxBytesError
+				if errors.As(copyErr, &tooLarge) {
+					return nil, copyErr
+				}
 				return nil, bad("invalid options")
 			}
 			if err := json.Unmarshal(data, &options); err != nil {
@@ -78,9 +93,20 @@ func (s *Store) Publish(reader *multipart.Reader) (*Receipt, error) {
 			}
 			seenOptions = true
 		case "file":
-			name := part.Header.Get("X-Artifact-Path")
-			if name == "" {
-				name = part.FileName()
+			var name string
+			if esc := part.Header.Get("X-Artifact-Path-Escaped"); esc != "" {
+				unescaped, err := url.PathUnescape(esc)
+				if err != nil {
+					return nil, bad("invalid escaped file path %q", esc)
+				}
+				name = unescaped
+			} else {
+				name = part.Header.Get("X-Artifact-Path")
+				if name == "" {
+					name = part.FileName()
+				} else if fn := part.FileName(); fn != "" && fn != name && strings.TrimSpace(fn) == name {
+					name = fn
+				}
 			}
 			if !validPath(name) {
 				return nil, bad("invalid file path %q", name)
@@ -95,10 +121,16 @@ func (s *Store) Publish(reader *multipart.Reader) (*Receipt, error) {
 			}
 			target := filepath.Join(stage, filepath.FromSlash(name))
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				if errors.Is(err, syscall.ENAMETOOLONG) {
+					return nil, bad("file path too long: %v", err)
+				}
 				return nil, err
 			}
 			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 			if err != nil {
+				if errors.Is(err, syscall.ENAMETOOLONG) {
+					return nil, bad("file path too long: %v", err)
+				}
 				return nil, err
 			}
 			hash := sha256.New()
@@ -119,6 +151,10 @@ func (s *Store) Publish(reader *multipart.Reader) (*Receipt, error) {
 			return nil, bad("unknown form part %q", part.FormName())
 		}
 		if err := part.Close(); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return nil, err
+			}
 			return nil, bad("incomplete part: %v", err)
 		}
 	}
