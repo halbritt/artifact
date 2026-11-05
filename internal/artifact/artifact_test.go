@@ -464,9 +464,9 @@ func TestPublishUnicodePathsRoundTrip(t *testing.T) {
 	_, server := fixture(t)
 	dir := t.TempDir()
 	files := map[string]string{
-		"café.html":        "<h1>Café</h1>",
-		"日本語/ドキュメント.txt":   "こんにちは世界",
-		"🎉/rocket 🚀.json":  `{"status":"ok"}`,
+		"café.html":       "<h1>Café</h1>",
+		"日本語/ドキュメント.txt":  "こんにちは世界",
+		"🎉/rocket 🚀.json": `{"status":"ok"}`,
 	}
 	for name, data := range files {
 		writeFile(t, dir, name, data)
@@ -552,7 +552,7 @@ func TestPublishPreservesLeadingAndTrailingSpaces(t *testing.T) {
 	_, server := fixture(t)
 	dir := t.TempDir()
 	files := map[string]string{
-		" leading_and_trailing.txt ":             "space content 1",
+		" leading_and_trailing.txt ":            "space content 1",
 		"  folder with spaces  /  file  .txt  ": "space content 2",
 	}
 	for name, data := range files {
@@ -1057,4 +1057,153 @@ func TestReceiptInventoryExactBijection(t *testing.T) {
 	}
 }
 
+func TestNewStore_PurgesStaleStagingDirectories(t *testing.T) {
+	dataDir := t.TempDir()
+	staging := filepath.Join(dataDir, "staging")
+	published := filepath.Join(dataDir, "published")
 
+	// Pre-create staging and published directories with data
+	if err := os.MkdirAll(filepath.Join(staging, "upload-stale1"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "upload-stale1", "partial.bin"), []byte("garbage"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(staging, "upload-stale2"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "stray.tmp"), []byte("stray"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pubDir := filepath.Join(published, "valid-publication")
+	if err := os.MkdirAll(pubDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pubDir, "data.txt"), []byte("preserve this"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initialize NewStore
+	store, err := NewStore(dataDir, "http://example.test")
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	if store == nil {
+		t.Fatal("expected non-nil store")
+	}
+
+	// Verify staging is completely purged
+	stagingEntries, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatalf("read staging: %v", err)
+	}
+	if len(stagingEntries) != 0 {
+		t.Fatalf("expected 0 staging entries after NewStore, found %d", len(stagingEntries))
+	}
+
+	// Verify published data is intact
+	preserved, err := os.ReadFile(filepath.Join(pubDir, "data.txt"))
+	if err != nil {
+		t.Fatalf("read published data: %v", err)
+	}
+	if string(preserved) != "preserve this" {
+		t.Fatalf("published data corrupted: got %q, want %q", string(preserved), "preserve this")
+	}
+}
+
+func TestUpload_ConnectionClosedCleansStaging(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir, "http://example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(store.Handler())
+	defer server.Close()
+
+	// Truncate the multipart body mid-stream to simulate an abrupt client disconnect.
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("options", `{"title": "aborted"}`)
+	part, err := w.CreateFormFile("file", "aborted.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("some initial data before disconnect"))
+	contentType := w.FormDataContentType()
+
+	// Truncate without closing writer to cause unexpected EOF during upload
+	truncated := buf.Bytes()
+
+	req, err := http.NewRequest("POST", server.URL+"/api/artifacts", bytes.NewReader(truncated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := server.Client().Do(req)
+	if err == nil && resp != nil {
+		resp.Body.Close()
+	}
+
+	// Wait for store handlers to complete cleanup
+	store.Wait()
+
+	entries, err := os.ReadDir(filepath.Join(dataDir, "staging"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 staging entries after connection closed, found %d", len(entries))
+	}
+}
+
+func TestUpload_ServerShutdownForcedCloseCleansStaging(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir, "http://example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(store.Handler())
+
+	pr, pw := io.Pipe()
+	w := multipart.NewWriter(pw)
+
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		req, err := http.NewRequest("POST", server.URL+"/api/artifacts", pr)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		resp, err := server.Client().Do(req)
+		if err == nil && resp != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	// Write options and part header into pipe
+	_ = w.WriteField("options", `{"title": "stalled"}`)
+	part, err := w.CreateFormFile("file", "stalled.bin")
+	if err == nil {
+		_, _ = part.Write([]byte("stalled data"))
+	}
+
+	// Close the server forcefully (as in bounded daemon shutdown)
+	server.CloseClientConnections()
+	server.Close()
+	_ = pw.Close()
+	<-clientDone
+
+	// Wait for upload handlers to finish deferred cleanup
+	store.Wait()
+
+	entries, err := os.ReadDir(filepath.Join(dataDir, "staging"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 staging entries after server close, found %d", len(entries))
+	}
+}

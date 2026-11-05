@@ -34,7 +34,9 @@ func main() {
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("shutdown: %v", err)
+			_ = server.Close()
 		}
+		store.Wait()
 	}()
 	log.Printf("artifact serving %s at %s", *data, *listen)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

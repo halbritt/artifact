@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -396,6 +397,13 @@ func TestTier1_ARTIFACT11_FixtureSigtermClean(t *testing.T) {
 	port := getFreePort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
+	// Snapshot existing ui fixture temp dirs before starting
+	beforeDirs, _ := filepath.Glob("/tmp/artifact-ui-*")
+	beforeMap := make(map[string]bool)
+	for _, d := range beforeDirs {
+		beforeMap[d] = true
+	}
+
 	// Run tests/ui_fixture.py <port>
 	fixtureScript := filepath.Join(projectRoot, "tests", "ui_fixture.py")
 	cmd := exec.Command("python3", fixtureScript, fmt.Sprintf("%d", port))
@@ -432,8 +440,20 @@ func TestTier1_ARTIFACT11_FixtureSigtermClean(t *testing.T) {
 		t.Fatalf("ui_fixture did not start serving on port %d", port)
 	}
 
+	// Identify temporary directory created for this run
+	afterDirs, _ := filepath.Glob("/tmp/artifact-ui-*")
+	var createdDirs []string
+	for _, d := range afterDirs {
+		if !beforeMap[d] {
+			createdDirs = append(createdDirs, d)
+		}
+	}
+	if len(createdDirs) == 0 {
+		t.Fatalf("no temporary directory matching /tmp/artifact-ui-* was created by fixture")
+	}
+
 	// Send SIGTERM to the python process
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("signal fixture: %v", err)
 	}
 
@@ -442,12 +462,29 @@ func TestTier1_ARTIFACT11_FixtureSigtermClean(t *testing.T) {
 		done <- cmd.Wait()
 	}()
 
+	var waitErr error
 	select {
-	case <-done:
-		// Cleanly exited
+	case waitErr = <-done:
+		// Process exited
 	case <-time.After(10 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatal("fixture did not exit within 10s after SIGTERM")
+	}
+
+	// Verify clean exit: exit code 0 or -15 (terminated by SIGTERM)
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			status, ok := exitErr.Sys().(syscall.WaitStatus)
+			if ok {
+				if status.ExitStatus() != 0 && !(status.Signaled() && status.Signal() == syscall.SIGTERM) {
+					t.Fatalf("fixture exited with unexpected code: %v", exitErr)
+				}
+			} else {
+				t.Fatalf("fixture wait error: %v", waitErr)
+			}
+		} else {
+			t.Fatalf("fixture wait error: %v", waitErr)
+		}
 	}
 
 	// Verify port is closed
@@ -456,5 +493,24 @@ func TestTier1_ARTIFACT11_FixtureSigtermClean(t *testing.T) {
 	if err == nil {
 		conn.Close()
 		t.Fatalf("fixture port %d is still open after SIGTERM shutdown", port)
+	}
+
+	// Verify child artifactd process is no longer running
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err == nil && strings.Contains(string(cmdline), fmt.Sprintf("127.0.0.1:%d", port)) {
+			t.Fatalf("child artifactd PID %s is still running for port %d", entry.Name(), port)
+		}
+	}
+
+	// Verify temporary directory created for this run is removed
+	for _, dir := range createdDirs {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("temporary directory %s was not cleaned up after SIGTERM", dir)
+		}
 	}
 }

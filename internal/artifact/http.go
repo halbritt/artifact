@@ -83,6 +83,8 @@ func (s *Store) Handler() http.Handler {
 	})
 }
 func (s *Store) upload(w http.ResponseWriter, r *http.Request) {
+	s.wg.Add(1)
+	defer s.wg.Done()
 	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadBytes)
 	mr, err := r.MultipartReader()
 	if err != nil {

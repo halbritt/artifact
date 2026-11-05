@@ -3,18 +3,29 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
 
+
+def _handle_signal(signum, frame):
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGHUP, _handle_signal)
+
 port = sys.argv[1]
 base = f"http://127.0.0.1:{port}"
 with tempfile.TemporaryDirectory(prefix="artifact-ui-") as temp:
     root = Path(temp)
-    proc = subprocess.Popen(["bin/artifactd", "--listen", f"127.0.0.1:{port}", "--data", str(root / "store"), "--base-url", base])
+    proc = None
     try:
+        proc = subprocess.Popen(["bin/artifactd", "--listen", f"127.0.0.1:{port}", "--data", str(root / "store"), "--base-url", base])
         for attempt in range(100):
             if proc.poll() is not None:
                 raise RuntimeError("artifactd exited during startup")
@@ -38,5 +49,15 @@ with tempfile.TemporaryDirectory(prefix="artifact-ui-") as temp:
         manifest.write_text(manifest.read_text().replace(f"/{old}/", "/sample/").replace(f'"{old}"', '"sample"'))
         proc.wait()
     finally:
-        proc.terminate()
-        proc.wait(timeout=20)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (ProcessLookupError, OSError):
+                    pass
+            except (ProcessLookupError, OSError):
+                pass

@@ -24,6 +24,7 @@ import (
 type Store struct {
 	Root, BaseURL string
 	mu            sync.Mutex
+	wg            sync.WaitGroup
 }
 type InputError struct {
 	Message string
@@ -43,7 +44,21 @@ func NewStore(root, base string) (*Store, error) {
 			return nil, err
 		}
 	}
+	stagingDir := filepath.Join(root, "staging")
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(stagingDir, entry.Name())); err != nil {
+			return nil, err
+		}
+	}
 	return &Store{Root: root, BaseURL: strings.TrimRight(base, "/")}, nil
+}
+
+func (s *Store) Wait() {
+	s.wg.Wait()
 }
 
 // Publish writes only to staging until every part, manifest and archive is complete.
